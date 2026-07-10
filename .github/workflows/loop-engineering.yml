@@ -90,7 +90,7 @@ jobs:
           export OPENCODE_CONFIG="$state_dir/opencode.ci.json"
 
           issues_file="$state_dir/issues.json"
-          gh issue list --state open --limit 100 --json number,title,body,url > "$issues_file"
+          gh issue list --state open --limit 1000 --json number,title,body,url > "$issues_file"
 
           count=$(jq length "$issues_file")
           if [[ "$count" -eq 0 ]]; then
