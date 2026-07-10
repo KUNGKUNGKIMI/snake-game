@@ -59,10 +59,25 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ -z "${ANTHROPIC_API_KEY:-}" && -z "${OPENAI_API_KEY:-}" ]]; then
-            echo "No model API key configured. Add ANTHROPIC_API_KEY or OPENAI_API_KEY as a repository secret."
-            exit 1
-          fi
+          provider="${OPENCODE_MODEL%%/*}"
+          case "$provider" in
+            anthropic)
+              if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+                echo "OPENCODE_MODEL uses Anthropic. Add ANTHROPIC_API_KEY as a repository secret."
+                exit 1
+              fi
+              ;;
+            openai)
+              if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+                echo "OPENCODE_MODEL uses OpenAI. Add OPENAI_API_KEY as a repository secret."
+                exit 1
+              fi
+              ;;
+            *)
+              echo "Unsupported OPENCODE_MODEL provider: ${provider}. Use an anthropic/... or openai/... model."
+              exit 1
+              ;;
+          esac
 
           state_dir="${RUNNER_TEMP:-/tmp}/loop-engineering"
           mkdir -p "$state_dir"
