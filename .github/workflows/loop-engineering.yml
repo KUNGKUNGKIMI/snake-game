@@ -1,0 +1,182 @@
+name: Loop Engineering
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: read
+  pull-requests: write
+
+concurrency:
+  group: loop-engineering
+  cancel-in-progress: false
+
+jobs:
+  solve-issues:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      OPENCODE_MODEL: ${{ vars.OPENCODE_MODEL || 'anthropic/claude-sonnet-4-20250514' }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install project dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest
+
+      - name: Install OpenCode
+        run: npm install -g opencode-ai
+
+      - name: Configure git author
+        run: |
+          git config user.name "loop-engineering[bot]"
+          git config user.email "loop-engineering[bot]@users.noreply.github.com"
+
+      - name: Process open issues
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${ANTHROPIC_API_KEY:-}" && -z "${OPENAI_API_KEY:-}" ]]; then
+            echo "No model API key configured. Add ANTHROPIC_API_KEY or OPENAI_API_KEY as a repository secret."
+            exit 1
+          fi
+
+          state_dir="${RUNNER_TEMP:-/tmp}/loop-engineering"
+          mkdir -p "$state_dir"
+
+          cat > "$state_dir/opencode.ci.json" <<'JSON'
+          {
+            "$schema": "https://opencode.ai/config.json",
+            "model": "{env:OPENCODE_MODEL}",
+            "provider": {
+              "anthropic": {
+                "models": {},
+                "options": {
+                  "apiKey": "{env:ANTHROPIC_API_KEY}"
+                }
+              },
+              "openai": {
+                "models": {},
+                "options": {
+                  "apiKey": "{env:OPENAI_API_KEY}"
+                }
+              }
+            }
+          }
+          JSON
+          export OPENCODE_CONFIG="$state_dir/opencode.ci.json"
+
+          issues_file="$state_dir/issues.json"
+          gh issue list --state open --limit 100 --json number,title,body,url > "$issues_file"
+
+          count=$(jq length "$issues_file")
+          if [[ "$count" -eq 0 ]]; then
+            echo "No open issues to process."
+            exit 0
+          fi
+
+          default_branch=$(git remote show origin | sed -n '/HEAD branch/s/.*: //p')
+          if [[ -z "$default_branch" ]]; then
+            default_branch="main"
+          fi
+
+          for row in $(jq -r '.[] | @base64' "$issues_file"); do
+            issue_json=$(printf '%s' "$row" | base64 --decode)
+            number=$(jq -r '.number' <<< "$issue_json")
+            title=$(jq -r '.title' <<< "$issue_json")
+            body=$(jq -r '.body // ""' <<< "$issue_json")
+            url=$(jq -r '.url' <<< "$issue_json")
+            branch="loop/issue-${number}"
+
+            if gh pr list --state open --head "$branch" --json number --jq 'length' | grep -qx '[1-9][0-9]*'; then
+              echo "Issue #${number}: open PR already exists for ${branch}; skipping."
+              continue
+            fi
+
+            echo "Issue #${number}: starting ${title}"
+            git checkout "$default_branch"
+            git pull --ff-only origin "$default_branch"
+            git checkout -B "$branch"
+
+            prompt_file=$(mktemp)
+            cat > "$prompt_file" <<PROMPT
+          You are running in GitHub Actions for KUNGKUNGKIMI/snake-game.
+
+          TASK
+          Fix GitHub issue #${number}: ${title}
+
+          ISSUE URL
+          ${url}
+
+          ISSUE BODY
+          ${body}
+
+          REQUIREMENTS
+          - Make the smallest correct code change that resolves the issue.
+          - Preserve the existing Python/Pygame project style.
+          - Add or update tests when the issue changes behavior that can be tested.
+          - Do not modify .github/workflows/loop-engineering.yml.
+          - Do not close the issue directly.
+          - Do not commit changes yourself.
+          - If the issue is unclear or cannot be fixed safely, leave the repository unchanged.
+
+          VERIFICATION
+          Run python -m pytest tests/ -v before finishing when you make code or test changes.
+          PROMPT
+
+            if ! opencode run --auto "$(cat "$prompt_file")"; then
+              echo "Issue #${number}: opencode failed; resetting and continuing."
+              git reset --hard
+              git clean -fd
+              continue
+            fi
+
+            rm -f "$prompt_file"
+
+            if git diff --quiet && git diff --cached --quiet; then
+              echo "Issue #${number}: no changes produced."
+              continue
+            fi
+
+            if ! python -m pytest tests/ -v; then
+              echo "Issue #${number}: tests failed; resetting and continuing."
+              git reset --hard
+              git clean -fd
+              continue
+            fi
+
+            git add -A
+            git commit -m "Fix issue #${number}: ${title}"
+            git push --force-with-lease origin "$branch"
+
+            gh pr create \
+              --base "$default_branch" \
+              --head "$branch" \
+              --title "Fix #${number}: ${title}" \
+              --body "Automated loop-engineering fix for ${url}.
+
+          Fixes #${number}"
+          done
